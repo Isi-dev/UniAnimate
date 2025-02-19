@@ -45,7 +45,7 @@ from utils.seed import setup_seed
 from utils.multi_port import find_free_port
 from utils.assign_cfg import assign_signle_cfg
 from utils.distributed import generalized_all_gather, all_reduce
-from utils.video_op import save_i2vgen_video, save_t2vhigen_video_safe, save_video_multiple_conditions_not_gif_horizontal_3col
+from utils.video_op import save_i2vgen_video, save_t2vhigen_video_safe, save_video_multiple_conditions_not_gif_horizontal_3col, save_video_multiple_conditions_not_gif_horizontal_1col
 from tools.modules.autoencoder import get_first_stage_encoding
 from utils.registry_class import INFER_ENGINE, MODEL, EMBEDDER, AUTO_ENCODER, DIFFUSION
 from copy import copy
@@ -247,7 +247,8 @@ def worker(gpu, cfg, cfg_update):
         cfg.UNet["config"] = cfg
     cfg.UNet["zero_y"] = zero_y
     model = MODEL.build(cfg.UNet)
-    state_dict = torch.load(cfg.test_model, map_location='cpu')
+    # state_dict = torch.load(cfg.test_model, map_location='cpu')
+    state_dict = torch.load(cfg.test_model, map_location=f"cuda:{gpu}")
     if 'state_dict' in state_dict:
         state_dict = state_dict['state_dict']
     if 'step' in state_dict:
@@ -256,6 +257,9 @@ def worker(gpu, cfg, cfg_update):
         resume_step = 0
     status = model.load_state_dict(state_dict, strict=True)
     logging.info('Load model from {} with status {}'.format(cfg.test_model, status))
+
+    del state_dict
+    torch.cuda.empty_cache()
     model = model.to(gpu)
     model.eval()
     if hasattr(cfg, "CPU_CLIP_VAE") and cfg.CPU_CLIP_VAE:
@@ -417,8 +421,11 @@ def worker(gpu, cfg, cfg_update):
                 
                 if hasattr(cfg, "CPU_CLIP_VAE") and cfg.CPU_CLIP_VAE:
                     clip_encoder.cpu() # add this line
+                    del clip_encoder  # Delete this object to free memory
                     autoencoder.cpu() # add this line
                     torch.cuda.empty_cache() # add this line
+                    import gc
+                    gc.collect()
                     
                 video_data = diffusion.ddim_sample_loop(
                     noise=noise_one,
@@ -428,10 +435,20 @@ def worker(gpu, cfg, cfg_update):
                     ddim_timesteps=cfg.ddim_timesteps,
                     eta=0.0)
                 
+                # if hasattr(cfg, "CPU_CLIP_VAE") and cfg.CPU_CLIP_VAE:
+                #     # if run forward of  autoencoder or clip_encoder second times, load them again
+                #     clip_encoder.cuda()
+                #     autoencoder.cuda()
+
+
                 if hasattr(cfg, "CPU_CLIP_VAE") and cfg.CPU_CLIP_VAE:
                     # if run forward of  autoencoder or clip_encoder second times, load them again
-                    clip_encoder.cuda()
+                    # clip_encoder.cuda()
+                    del diffusion
+                    torch.cuda.empty_cache()
+                    gc.collect()
                     autoencoder.cuda()
+                    
                 video_data = 1. / cfg.scale_factor * video_data 
                 video_data = rearrange(video_data, 'b c f h w -> (b f) c h w')
                 chunk_size = min(cfg.decoder_bs, video_data.shape[0])
@@ -450,6 +467,7 @@ def worker(gpu, cfg, cfg_update):
                     name = name + "_" + ii
                 file_name = f'rank_{cfg.world_size:02d}_{cfg.rank:02d}_{idx:02d}_{name}_{cap_name}_{cfg.resolution[1]}x{cfg.resolution[0]}.mp4'
                 local_path = os.path.join(cfg.log_dir, f'{file_name}')
+                local_path_1col = os.path.join(cfg.log_dir, f'{file_name[:-4]}_results_1col.mp4')
                 os.makedirs(os.path.dirname(local_path), exist_ok=True)
                 captions = "human"
                 del model_kwargs_one_vis[0][list(model_kwargs_one_vis[0].keys())[0]]
@@ -457,6 +475,9 @@ def worker(gpu, cfg, cfg_update):
                 
                 save_video_multiple_conditions_not_gif_horizontal_3col(local_path, video_data.cpu(), model_kwargs_one_vis, misc_backups, 
                                                 cfg.mean, cfg.std, nrow=1, save_fps=cfg.save_fps)
+
+                save_video_multiple_conditions_not_gif_horizontal_1col(local_path_1col, video_data.cpu(), model_kwargs_one_vis, misc_backups, 
+                                                cfg.mean, cfg.std, nrow=1, save_fps=cfg.save_fps) 
                 
                 # try:
                 #     save_t2vhigen_video_safe(local_path, video_data.cpu(), captions, cfg.mean, cfg.std, text_size)
